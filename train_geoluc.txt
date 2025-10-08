@@ -1,0 +1,197 @@
+import os
+import pandas as pd
+import numpy as np
+import joblib
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import (
+    classification_report, confusion_matrix, accuracy_score,
+    mean_absolute_error, mean_squared_error, r2_score
+)
+from xgboost import XGBClassifier, XGBRegressor
+import shap
+from math import sqrt
+
+# -------------------------------
+# Auto-detect current folder
+# -------------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATASET_PATH = os.path.join(BASE_DIR, "Global 2_Land_Use_Change_10000.csv")
+
+if not os.path.exists(DATASET_PATH):
+    raise FileNotFoundError(f"❌ Dataset not found at: {DATASET_PATH}")
+
+# -------------------------------
+# Load dataset
+# -------------------------------
+df = pd.read_csv(DATASET_PATH, index_col=0, encoding="windows-1252").reset_index()
+print("✅ Dataset loaded:", df.shape)
+
+RANDOM_STATE = 42
+
+# -------------------------------
+# Preprocessing
+# -------------------------------
+def preprocess_for_classification(df, drop_na=True):
+    df = df.copy()
+    if drop_na:
+        df = df.dropna().reset_index(drop=True)
+    features = ['Region','Year','Area_sq_km','NDVI','Population_Density','Temperature_Anomaly']
+    target = 'Land_Cover_Type'
+    X = df[features].copy()
+    y = df[target].copy()
+    X = pd.get_dummies(X, columns=['Region'], drop_first=True)
+    return X, y
+
+def preprocess_for_regression(df, drop_na=True):
+    df = df.copy()
+    if drop_na:
+        df = df.dropna().reset_index(drop=True)
+    features = ['Region','Year','NDVI','Population_Density','Temperature_Anomaly','Land_Cover_Type']
+    target = 'Area_sq_km'
+    X = df[features].copy()
+    y = df[target].copy()
+    X = pd.get_dummies(X, columns=['Region','Land_Cover_Type'], drop_first=True)
+    return X, y
+
+# -------------------------------
+# Classification (XGBoost)
+# -------------------------------
+Xc, yc = preprocess_for_classification(df)
+le = LabelEncoder()
+yc_enc = le.fit_transform(yc)
+
+Xc_train, Xc_test, yc_train, yc_test = train_test_split(
+    Xc, yc_enc, test_size=0.2, random_state=RANDOM_STATE, stratify=yc_enc
+)
+
+xgb = XGBClassifier(
+    n_estimators=200, use_label_encoder=False, eval_metric='mlogloss',
+    random_state=RANDOM_STATE, n_jobs=4
+)
+xgb.fit(Xc_train, yc_train)
+xgb_preds = xgb.predict(Xc_test)
+
+print("XGBoost — Accuracy:", accuracy_score(yc_test, xgb_preds))
+print(classification_report(yc_test, xgb_preds, target_names=le.classes_))
+
+cm = confusion_matrix(yc_test, xgb_preds)
+plt.figure(figsize=(8,6))
+sns.heatmap(cm, annot=True, fmt='d', xticklabels=le.classes_, yticklabels=le.classes_, cmap='Blues')
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.title("Confusion Matrix - XGBoost")
+plt.show()
+
+# Save classification predictions
+pred_df = Xc_test.copy()
+pred_df['true_label'] = le.inverse_transform(yc_test)
+pred_df['pred_label'] = le.inverse_transform(xgb_preds)
+
+# -------------------------------
+# SHAP for Classification (robust)
+# -------------------------------
+explainer = shap.TreeExplainer(xgb)
+sample_Xc = Xc_train.sample(min(1000, len(Xc_train)), random_state=42)
+shap_values = explainer.shap_values(sample_Xc)
+
+if isinstance(shap_values, list):
+    # Multiclass → average across classes
+    mean_abs = np.mean([np.abs(sv).mean(axis=0) for sv in shap_values], axis=0)
+elif isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
+    mean_abs = np.mean(np.abs(shap_values), axis=(0, 1))
+else:
+    mean_abs = np.abs(shap_values).mean(axis=0)
+
+mean_abs = np.array(mean_abs).flatten()
+if mean_abs.shape[0] != sample_Xc.shape[1]:
+    min_len = min(mean_abs.shape[0], sample_Xc.shape[1])
+    mean_abs = mean_abs[:min_len]
+    features = sample_Xc.columns[:min_len]
+else:
+    features = sample_Xc.columns
+
+feat_imp = pd.DataFrame({
+    "feature": features,
+    "mean_abs_shap": mean_abs
+}).sort_values("mean_abs_shap", ascending=False)
+
+# -------------------------------
+# Regression (XGBoost)
+# -------------------------------
+Xr, yr = preprocess_for_regression(df)
+mask = yr.notna() & np.isfinite(yr)
+Xr = Xr.loc[mask].reset_index(drop=True)
+yr = yr.loc[mask].reset_index(drop=True)
+
+Xr_train, Xr_test, yr_train, yr_test = train_test_split(
+    Xr, yr, test_size=0.2, random_state=RANDOM_STATE
+)
+
+xgbr = XGBRegressor(n_estimators=200, random_state=RANDOM_STATE, n_jobs=4)
+xgbr.fit(Xr_train, yr_train)
+xgbr_preds = xgbr.predict(Xr_test)
+
+print("XGBoostReg — MAE:", mean_absolute_error(yr_test, xgbr_preds))
+print("XGBoostReg — RMSE:", sqrt(mean_squared_error(yr_test, xgbr_preds)))
+print("XGBoostReg — R2:", r2_score(yr_test, xgbr_preds))
+
+reg_df = Xr_test.copy()
+reg_df['true_area_sq_km'] = yr_test
+reg_df['pred_area_xgb'] = xgbr_preds
+
+# -------------------------------
+# SHAP for Regression (final fix)
+# -------------------------------
+sample_Xr = Xr_train.sample(min(1000, len(Xr_train)), random_state=42)
+
+# Force numeric type and convert to NumPy float32
+sample_Xr = sample_Xr.apply(pd.to_numeric, errors="coerce").fillna(0).astype(np.float32)
+sample_np = sample_Xr.values
+
+explainer_reg = shap.TreeExplainer(xgbr)
+shap_values_reg = explainer_reg.shap_values(sample_np)
+
+mean_abs_reg = np.abs(shap_values_reg).mean(axis=0)
+
+feat_imp_reg = pd.DataFrame({
+    "feature": list(sample_Xr.columns),
+    "mean_abs_shap": mean_abs_reg.flatten()
+}).sort_values("mean_abs_shap", ascending=False)
+
+# -------------------------------
+# Prescriptive Analytics
+# -------------------------------
+prescribe = df.groupby('Region').agg({
+    'NDVI': 'mean',
+    'Temperature_Anomaly': 'mean',
+    'Area_sq_km': 'sum'
+}).reset_index().sort_values(['NDVI','Temperature_Anomaly'])
+prescribe['priority_score'] = (
+    prescribe['Temperature_Anomaly'].rank(ascending=False) +
+    prescribe['NDVI'].rank(ascending=True)
+)
+prescribe = prescribe.sort_values('priority_score', ascending=False)
+
+# -------------------------------
+# Save Models + Outputs
+# -------------------------------
+clf_path = os.path.join(BASE_DIR, "xgb_classification_model.joblib")
+reg_path = os.path.join(BASE_DIR, "xgb_regression_model.joblib")
+pred_class_path = os.path.join(BASE_DIR, "predictions_classification.csv")
+pred_reg_path   = os.path.join(BASE_DIR, "predictions_regression.csv")
+feat_class_path = os.path.join(BASE_DIR, "feature_importances_classification.csv")
+feat_reg_path   = os.path.join(BASE_DIR, "feature_importances_regression.csv")
+prescriptive_path = os.path.join(BASE_DIR, "prescriptive_region_priority.csv")
+
+joblib.dump(xgb, clf_path)
+joblib.dump(xgbr, reg_path)
+pred_df.to_csv(pred_class_path, index=False)
+reg_df.to_csv(pred_reg_path, index=False)
+feat_imp.to_csv(feat_class_path, index=False)
+feat_imp_reg.to_csv(feat_reg_path, index=False)
+prescribe.to_csv(prescriptive_path, index=False)
+
+print("✅ Models and outputs saved in:", BASE_DIR)

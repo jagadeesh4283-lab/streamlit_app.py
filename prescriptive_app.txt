@@ -1,0 +1,131 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# -------------------------------------------------------------
+# Helper functions
+# -------------------------------------------------------------
+
+def normalize(series, invert=False):
+    """Normalize a pandas Series to [0,1], optionally invert."""
+    if series.max() == series.min():
+        return pd.Series([0]*len(series), index=series.index)
+    s = (series - series.min()) / (series.max() - series.min())
+    return 1 - s if invert else s
+
+def compute_prescriptive(df_orig, pred_class):
+    """Compute prescriptive analytics table from original & predicted data."""
+
+    # STEP 1: Aggregate baseline region stats
+    agg = df_orig.groupby("Region").agg({
+        "NDVI": "mean",
+        "Temperature_Anomaly": "mean",
+        "Area_sq_km": "sum",
+        "Population_Density": "mean"
+    }).reset_index()
+
+    agg["ndvi_risk"]      = normalize(agg["NDVI"], invert=True)
+    agg["temp_risk"]      = normalize(agg["Temperature_Anomaly"])
+    agg["area_pressure"]  = normalize(agg["Area_sq_km"])
+    agg["pop_pressure"]   = normalize(agg["Population_Density"])
+
+    agg["priority_score"] = (
+        0.4 * agg["ndvi_risk"]
+      + 0.3 * agg["temp_risk"]
+      + 0.2 * agg["area_pressure"]
+      + 0.1 * agg["pop_pressure"]
+    )
+
+    # STEP 2: Rebuild Region column from one-hot encoded columns
+    region_cols = [c for c in pred_class.columns if c.startswith("Region_")]
+    if "Region" not in pred_class.columns:
+        def get_region_from_dummies(row):
+            for col in region_cols:
+                if row[col]:
+                    return col.replace("Region_", "")
+            return "Unknown"
+        pred_class["Region"] = pred_class.apply(get_region_from_dummies, axis=1)
+
+    # Filter for urban-like predictions
+    urban_preds = pred_class[pred_class["pred_label"].str.contains("Urban", case=False)]
+    urban_risk_counts = (
+        urban_preds
+        .groupby("Region")
+        .size()
+        .reset_index(name="urban_pred_freq")
+    )
+
+    # STEP 3: Merge & adjust scores
+    prescriptive_df = agg.merge(urban_risk_counts, on="Region", how="left").fillna(0)
+    prescriptive_df["priority_score_adjusted"] = (
+        prescriptive_df["priority_score"]
+        + 0.2 * normalize(prescriptive_df["urban_pred_freq"])
+    )
+
+    # STEP 4: Recommendations
+    def recommend_action(row):
+        if row["priority_score_adjusted"] > 0.75:
+            return "High priority – strengthen conservation & land-use regulation"
+        elif row["priority_score_adjusted"] > 0.5:
+            return "Medium priority – monitor & plan mitigation"
+        else:
+            return "Low priority – routine monitoring"
+
+    prescriptive_df["recommended_action"] = prescriptive_df.apply(recommend_action, axis=1)
+
+    return prescriptive_df.sort_values("priority_score_adjusted", ascending=False)
+
+
+# -------------------------------------------------------------
+# Streamlit UI
+# -------------------------------------------------------------
+
+st.set_page_config(page_title="GEOLUC Prescriptive Analytics", layout="wide")
+st.title("🌍 GEOLUC Prescriptive Analytics Dashboard")
+st.markdown("Upload the original dataset and the classification predictions file to generate priority scores and recommendations.")
+
+# File uploads
+orig_file = st.file_uploader("Upload original dataset CSV (with Region, NDVI, etc.)", type="csv")
+pred_file = st.file_uploader("Upload predictions_classification.csv", type="csv")
+
+if orig_file and pred_file:
+    df_orig = pd.read_csv(orig_file)
+    pred_class = pd.read_csv(pred_file)
+
+    st.success("✅ Files uploaded successfully.")
+    st.write("Original dataset preview:")
+    st.dataframe(df_orig.head())
+
+    st.write("Predictions dataset preview:")
+    st.dataframe(pred_class.head())
+
+    # Compute prescriptive analytics
+    with st.spinner("Computing prescriptive analytics..."):
+        prescriptive_df = compute_prescriptive(df_orig, pred_class)
+
+    st.success("✅ Prescriptive analytics computed.")
+
+    # Display results
+    st.subheader("📈 Priority Regions Table")
+    st.dataframe(prescriptive_df)
+
+    # Downloadable CSV
+    csv_bytes = prescriptive_df.to_csv(index=False).encode("utf-8")
+    st.download_button("💾 Download Prescriptive Table as CSV", data=csv_bytes, file_name="prescriptive_region_priority.csv", mime="text/csv")
+
+    # Visualization
+    st.subheader("📊 Top 7 Regions by Priority Score")
+    top15 = prescriptive_df.head(15)
+
+    fig, ax = plt.subplots(figsize=(10,6))
+    sns.barplot(data=top15, x="priority_score_adjusted", y="Region", hue="recommended_action", dodge=False, ax=ax)
+    ax.set_xlabel("Adjusted Priority Score")
+    ax.set_ylabel("Region")
+    ax.set_title("Top 7 Regions by Priority Score")
+    ax.legend(title="Recommended Action")
+    st.pyplot(fig)
+
+else:
+    st.info("⬆️ Please upload both CSV files to proceed.")
